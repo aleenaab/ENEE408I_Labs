@@ -52,6 +52,10 @@ class ObjectDetector:
                 point.point.y = y_camera
                 point.point.z = distance
                 self.position_pub.publish(point)
+                rospy.loginfo(
+                    f"3D position: x={x_camera:.2f} m, "
+                    f"y={y_camera:.2f} m, z={distance:.2f} m"
+                )
                 cv2.rectangle(
                     frame, (x, y), (x + w, y + h), (0, 255, 0), 2
                 )
