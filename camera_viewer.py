@@ -1,7 +1,7 @@
 import cv2
 
 # Replace with your TurtleBot's IP
-robot_ip = "192.168.1.50"
+robot_ip = "172.20.10.6"
 
 url = f"http://{robot_ip}:8080/stream?topic=/evade/detection_image&type=mjpeg"
 cap = cv2.VideoCapture(url)
