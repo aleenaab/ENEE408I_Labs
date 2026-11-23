@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 
+import signal
 import threading
 import time
 
 import cv2
 import numpy as np
-import rospy
+import rclpy
+from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.clock import Clock, ClockType
+from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
@@ -17,8 +24,9 @@ MIN_RED_AREA = 300
 FRAME_TIMEOUT = 0.5    # seconds
 
 
-class RedTurn:
+class RedTurn(Node):
     def __init__(self):
+        super().__init__("red_turn")
         self.bridge = CvBridge()
         self.kernel = np.ones((5, 5), np.uint8)
         self.lock = threading.Lock()
@@ -28,33 +36,34 @@ class RedTurn:
         self.last_status = None
         self.stopping = False
 
-        self.cmd_pub = rospy.Publisher(
-            "/cmd_vel", Twist, queue_size=1
+        # Separate groups keep the watchdog running during image processing.
+        self.image_group = MutuallyExclusiveCallbackGroup()
+        self.command_group = MutuallyExclusiveCallbackGroup()
+        camera_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
         )
-        self.image_pub = rospy.Publisher(
-            "/evade/detection_image", Image, queue_size=1
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 1)
+        self.image_pub = self.create_publisher(
+            Image, "/evade/detection_image", 1
         )
-
-        self.image_sub = rospy.Subscriber(
-            "/camera/image_raw",
-            Image,
-            self.image_callback,
-            queue_size=1,
-            buff_size=2**24,
+        self.image_sub = self.create_subscription(
+            Image, "/camera/image_raw", self.image_callback, camera_qos,
+            callback_group=self.image_group,
         )
-
-        self.timer = rospy.Timer(
-            rospy.Duration(0.05), self.publish_command
+        self.watchdog_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.timer = self.create_timer(
+            0.05, self.publish_command,
+            callback_group=self.command_group, clock=self.watchdog_clock,
         )
-        rospy.on_shutdown(self.stop)
-
-        rospy.loginfo("Ready: red detection with rotation only.")
+        self.get_logger().info("Ready: red detection with rotation only.")
 
     def image_callback(self, msg):
         received_at = time.monotonic()
 
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8").copy()
             width = frame.shape[1]
 
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -131,9 +140,9 @@ class RedTurn:
             with self.lock:
                 self.turn_direction = 0.0
                 self.last_frame_time = None
-            rospy.logerr_throttle(2.0, str(error))
+            self.get_logger().error(str(error), throttle_duration_sec=2.0)
 
-    def publish_command(self, event):
+    def publish_command(self):
         with self.lock:
             if self.stopping:
                 return
@@ -158,7 +167,7 @@ class RedTurn:
 
     def log_status(self, status):
         if status != self.last_status:
-            rospy.loginfo(status)
+            self.get_logger().info(status)
             self.last_status = status
 
     def stop(self):
@@ -166,18 +175,49 @@ class RedTurn:
             self.stopping = True
             self.turn_direction = 0.0
 
-        self.timer.shutdown()
+        self.timer.cancel()
 
         # Best-effort stop commands during shutdown.
         for _ in range(5):
             try:
                 self.cmd_pub.publish(Twist())
-            except rospy.ROSException:
+            except Exception:  # Shutdown publishing is best effort.
                 break
             time.sleep(0.05)
 
 
+def main(args=None):
+    # Keep the context alive until stop commands have been published.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    shutdown_requested = threading.Event()
+    previous_handlers = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(
+            signum, lambda *_: shutdown_requested.set()
+        )
+
+    node = None
+    executor = None
+    try:
+        node = RedTurn()
+        executor = MultiThreadedExecutor(num_threads=2)
+        executor.add_node(node)
+        while rclpy.ok() and not shutdown_requested.is_set():
+            executor.spin_once(timeout_sec=0.1)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            node.stop()
+        if executor is not None:
+            executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 if __name__ == "__main__":
-    rospy.init_node("red_turn")
-    node = RedTurn()
-    rospy.spin()
+    main()
